@@ -114,7 +114,12 @@
 
 #![recursion_limit = "512"]
 
-#[cfg(target_os = "windows")]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios",
+    target_os = "macos"
+))]
 #[macro_use]
 extern crate lazy_static;
 
@@ -125,8 +130,15 @@ extern crate stdweb;
 
 pub use samples_formats::{Sample, SampleFormat};
 
-#[cfg(not(any(windows, target_os = "linux", target_os = "freebsd",
-              target_os = "macos", target_os = "ios", target_os = "emscripten")))]
+#[cfg(not(any(
+    windows,
+    target_os = "android",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "emscripten"
+)))]
 use null as cpal_impl;
 
 use std::error::Error;
@@ -145,9 +157,13 @@ mod cpal_impl;
 #[path = "wasapi/mod.rs"]
 mod cpal_impl;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-#[path = "coreaudio/mod.rs"]
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
+#[path = "openal/mod.rs"]
 mod cpal_impl;
+
+// #[cfg(target_os = "macos")]
+// #[path = "coreaudio/mod.rs"]
+// mod cpal_impl;
 
 #[cfg(target_os = "emscripten")]
 #[path = "emscripten/mod.rs"]
