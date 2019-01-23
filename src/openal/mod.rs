@@ -28,7 +28,8 @@ lazy_static! {
     static ref ALTO: Alto = Alto::load_default().expect("failed to load OpenAL");
 }
 
-const OVERLAP_TIME: Duration = Duration::from_millis(32);
+const POLL_TIME: Duration = Duration::from_millis(4);
+const BUF_SIZE: usize = 44_100 * 2 / 10;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Device {
@@ -211,76 +212,49 @@ impl EventLoop {
     {
         let mut streams = self.streams.lock().unwrap();
         loop {
-            let mut min_wait_time: Option<Duration> = None;
             for (stream_id, stream) in streams
                 .iter_mut()
                 .enumerate()
                 .filter_map(|(pos, s)| s.as_mut().map(move |s| (StreamId(pos), s)))
             {
-                let sample_offset = stream.streaming_source.sample_offset();
                 let state = stream.streaming_source.state();
                 println!("State: {:?}", state);
-                let wait_time = match state {
-                    SourceState::Playing => {
-                        let samples_remaining = (stream.sample_len as u32)
-                            .checked_sub(sample_offset as u32)
-                            .unwrap();
-                        let wait_time = Duration::from_secs(1) * samples_remaining
-                            / stream.format.sample_rate.0;
-                        println!("sample_len: {:?}", stream.sample_len);
-                        println!("sample_offset: {:?}", sample_offset);
-                        println!("samples_remaining: {:?}", samples_remaining);
-                        println!("wait_time: {:?}", wait_time);
-                        Some(wait_time)
-                    },
-                    SourceState::Initial | SourceState::Stopped => Some(Duration::from_secs(0)),
-                    _ => None,
-                };
-                min_wait_time = min_wait_time.into_iter().chain(wait_time).min();
-                match wait_time {
-                    Some(d) if d <= OVERLAP_TIME => {
-                        let stream_data = match stream.format {
-                            Format {
-                                data_type: SampleFormat::I16,
-                                ..
-                            } => UnknownTypeOutputBuffer::I16(RootOutputBuffer {
-                                target: Some(OutputBuffer {
-                                    data: vec![0; 44100 * 2 / 3],
-                                    stream_inner: stream,
-                                }),
+                if state == SourceState::Initial
+                    || state == SourceState::Stopped
+                    || stream.streaming_source.buffers_processed() > 0
+                    || stream.streaming_source.buffers_queued() < 2
+                {
+                    let stream_data = match stream.format {
+                        Format {
+                            data_type: SampleFormat::I16,
+                            ..
+                        } => UnknownTypeOutputBuffer::I16(RootOutputBuffer {
+                            target: Some(OutputBuffer {
+                                data: vec![0; BUF_SIZE],
+                                stream_inner: stream,
                             }),
-                            Format {
-                                data_type: SampleFormat::F32,
-                                ..
-                            } => UnknownTypeOutputBuffer::F32(RootOutputBuffer {
-                                target: Some(OutputBuffer {
-                                    data: vec![0.0; 44100 * 2 / 3],
-                                    stream_inner: stream,
-                                }),
+                        }),
+                        Format {
+                            data_type: SampleFormat::F32,
+                            ..
+                        } => UnknownTypeOutputBuffer::F32(RootOutputBuffer {
+                            target: Some(OutputBuffer {
+                                data: vec![0.0; BUF_SIZE],
+                                stream_inner: stream,
                             }),
-                            _ => unimplemented!(),
-                        };
-                        callback(
-                            stream_id,
-                            StreamData::Output {
-                                buffer: stream_data,
-                            },
-                        )
-                    },
-                    _ => {},
+                        }),
+                        _ => unimplemented!(),
+                    };
+                    callback(
+                        stream_id,
+                        StreamData::Output {
+                            buffer: stream_data,
+                        },
+                    )
                 }
             }
 
-            streams = match min_wait_time {
-                Some(d) if d <= OVERLAP_TIME => continue,
-                Some(d) => {
-                    self.waiting
-                        .wait_timeout(streams, d - OVERLAP_TIME)
-                        .unwrap()
-                        .0
-                },
-                None => self.waiting.wait(streams).unwrap(),
-            };
+            streams = self.waiting.wait_timeout(streams, POLL_TIME).unwrap().0;
         }
     }
 }
