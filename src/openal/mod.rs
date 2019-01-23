@@ -103,7 +103,7 @@ impl Device {
     pub fn default_output_format(&self) -> Result<Format, DefaultFormatError> {
         Ok(Format {
             channels: 2,
-            data_type: SampleFormat::F32,
+            data_type: SampleFormat::I16,
             sample_rate: SampleRate(44_100),
         })
     }
@@ -148,7 +148,7 @@ pub fn default_output_device() -> Option<Device> {
 
 pub struct EventLoop {
     streams: Mutex<Vec<Option<StreamInner>>>,
-    send: Sender<()>,
+    send: Mutex<Sender<()>>,
     recv: Mutex<Receiver<()>>,
 }
 
@@ -157,7 +157,7 @@ impl EventLoop {
         let (send, recv) = mpsc::channel();
         EventLoop {
             streams: Default::default(),
-            send,
+            send: Mutex::new(send),
             recv: Mutex::new(recv),
         }
     }
@@ -185,7 +185,7 @@ impl EventLoop {
             format: format.clone(),
             sample_len: 0,
         });
-        drop(self.send.send(()));
+        drop(self.send.lock().unwrap().send(()));
         Ok(StreamId(p))
     }
 
@@ -195,7 +195,7 @@ impl EventLoop {
             .unwrap()
             .streaming_source
             .play();
-        drop(self.send.send(()))
+        drop(self.send.lock().unwrap().send(()))
     }
 
     pub fn pause_stream(&self, stream: StreamId) {
@@ -204,12 +204,12 @@ impl EventLoop {
             .unwrap()
             .streaming_source
             .pause();
-        drop(self.send.send(()))
+        drop(self.send.lock().unwrap().send(()))
     }
 
     pub fn destroy_stream(&self, stream: StreamId) {
         self.streams.lock().unwrap()[stream.0] = None;
-        drop(self.send.send(()))
+        drop(self.send.lock().unwrap().send(()))
     }
 
     pub fn run<F>(&self, mut callback: F) -> !
@@ -278,6 +278,8 @@ impl EventLoop {
                 }
             }
 
+            drop(streams);
+
             match min_wait_time {
                 Some(d) if d <= OVERLAP_TIME => continue,
                 Some(d) => drop(recv.recv_timeout(d - OVERLAP_TIME)),
@@ -326,7 +328,7 @@ impl<'a, T: 'a + Sample> OutputBuffer<'a, T> {
         let raw = self.data.as_ptr();
 
         let buf = {
-            let old_buf = (0 .. (self.stream_inner.streaming_source.buffers_queued() - 1))
+            let old_buf = (0 .. (self.stream_inner.streaming_source.buffers_queued() - 1).max(0))
                 .map(|_| {
                     let old_buf = self.stream_inner.streaming_source.unqueue_buffer().unwrap();
                     let size = old_buf.size();
