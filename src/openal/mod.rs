@@ -7,10 +7,7 @@ use self::alto::{
 use std::{
     ffi::CStr,
     marker::PhantomData,
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        Arc, Mutex, TryLockError,
-    },
+    sync::{Arc, Condvar, Mutex},
     time::Duration,
     vec::IntoIter,
 };
@@ -73,24 +70,24 @@ impl Device {
                     min_sample_rate: SampleRate(0),
                     max_sample_rate: SampleRate(44100),
                 },
-                SupportedFormat {
-                    channels: 2,
-                    data_type: SampleFormat::I16,
-                    min_sample_rate: SampleRate(0),
-                    max_sample_rate: SampleRate(44100),
-                },
-                SupportedFormat {
-                    channels: 1,
-                    data_type: SampleFormat::F32,
-                    min_sample_rate: SampleRate(0),
-                    max_sample_rate: SampleRate(44100),
-                },
-                SupportedFormat {
-                    channels: 2,
-                    data_type: SampleFormat::F32,
-                    min_sample_rate: SampleRate(0),
-                    max_sample_rate: SampleRate(44100),
-                },
+                // SupportedFormat {
+                //     channels: 2,
+                //     data_type: SampleFormat::I16,
+                //     min_sample_rate: SampleRate(0),
+                //     max_sample_rate: SampleRate(44100),
+                // },
+                // SupportedFormat {
+                //     channels: 1,
+                //     data_type: SampleFormat::F32,
+                //     min_sample_rate: SampleRate(0),
+                //     max_sample_rate: SampleRate(44100),
+                // },
+                // SupportedFormat {
+                //     channels: 2,
+                //     data_type: SampleFormat::F32,
+                //     min_sample_rate: SampleRate(0),
+                //     max_sample_rate: SampleRate(44100),
+                // },
             ]
             .into_iter(),
         ))
@@ -148,17 +145,14 @@ pub fn default_output_device() -> Option<Device> {
 
 pub struct EventLoop {
     streams: Mutex<Vec<Option<StreamInner>>>,
-    send: Mutex<Sender<()>>,
-    recv: Mutex<Receiver<()>>,
+    waiting: Condvar,
 }
 
 impl EventLoop {
     pub fn new() -> EventLoop {
-        let (send, recv) = mpsc::channel();
         EventLoop {
             streams: Default::default(),
-            send: Mutex::new(send),
-            recv: Mutex::new(recv),
+            waiting: Condvar::new(),
         }
     }
 
@@ -185,45 +179,38 @@ impl EventLoop {
             format: format.clone(),
             sample_len: 0,
         });
-        drop(self.send.lock().unwrap().send(()));
+        println!("{:?} build", StreamId(p));
+        self.waiting.notify_one();
         Ok(StreamId(p))
     }
 
     pub fn play_stream(&self, stream: StreamId) {
-        self.streams.lock().unwrap()[stream.0]
-            .as_mut()
-            .unwrap()
-            .streaming_source
-            .play();
-        drop(self.send.lock().unwrap().send(()))
+        let mut streams = self.streams.lock().unwrap();
+        streams[stream.0].as_mut().unwrap().streaming_source.play();
+        println!("{:?} play", stream);
+        self.waiting.notify_one();
     }
 
     pub fn pause_stream(&self, stream: StreamId) {
-        self.streams.lock().unwrap()[stream.0]
-            .as_mut()
-            .unwrap()
-            .streaming_source
-            .pause();
-        drop(self.send.lock().unwrap().send(()))
+        let mut streams = self.streams.lock().unwrap();
+        streams[stream.0].as_mut().unwrap().streaming_source.pause();
+        println!("{:?} pause", stream);
+        self.waiting.notify_one();
     }
 
     pub fn destroy_stream(&self, stream: StreamId) {
-        self.streams.lock().unwrap()[stream.0] = None;
-        drop(self.send.lock().unwrap().send(()))
+        let mut streams = self.streams.lock().unwrap();
+        streams[stream.0] = None;
+        println!("{:?} destroy", stream);
+        self.waiting.notify_one();
     }
 
     pub fn run<F>(&self, mut callback: F) -> !
     where
         F: FnMut(StreamId, StreamData) + Send,
     {
-        let recv = match self.recv.try_lock() {
-            Ok(guard) => guard,
-            Err(TryLockError::WouldBlock) => panic!("attempt to lock twice"),
-            Err(TryLockError::Poisoned(_)) => panic!("poisoned lock on `cpal::EventLoop::run`"),
-        };
+        let mut streams = self.streams.lock().unwrap();
         loop {
-            let mut streams = self.streams.lock().unwrap();
-
             let mut min_wait_time: Option<Duration> = None;
             for (stream_id, stream) in streams
                 .iter_mut()
@@ -231,13 +218,19 @@ impl EventLoop {
                 .filter_map(|(pos, s)| s.as_mut().map(move |s| (StreamId(pos), s)))
             {
                 let sample_offset = stream.streaming_source.sample_offset();
-                let wait_time = match stream.streaming_source.state() {
+                let state = stream.streaming_source.state();
+                println!("State: {:?}", state);
+                let wait_time = match state {
                     SourceState::Playing => {
                         let samples_remaining = (stream.sample_len as u32)
                             .checked_sub(sample_offset as u32)
                             .unwrap();
                         let wait_time = Duration::from_secs(1) * samples_remaining
                             / stream.format.sample_rate.0;
+                        println!("sample_len: {:?}", stream.sample_len);
+                        println!("sample_offset: {:?}", sample_offset);
+                        println!("samples_remaining: {:?}", samples_remaining);
+                        println!("wait_time: {:?}", wait_time);
                         Some(wait_time)
                     },
                     SourceState::Initial | SourceState::Stopped => Some(Duration::from_secs(0)),
@@ -252,7 +245,7 @@ impl EventLoop {
                                 ..
                             } => UnknownTypeOutputBuffer::I16(RootOutputBuffer {
                                 target: Some(OutputBuffer {
-                                    data: vec![0; 44100],
+                                    data: vec![0; 44100 * 2 / 3],
                                     stream_inner: stream,
                                 }),
                             }),
@@ -261,7 +254,7 @@ impl EventLoop {
                                 ..
                             } => UnknownTypeOutputBuffer::F32(RootOutputBuffer {
                                 target: Some(OutputBuffer {
-                                    data: vec![0.0; 44100],
+                                    data: vec![0.0; 44100 * 2 / 3],
                                     stream_inner: stream,
                                 }),
                             }),
@@ -278,13 +271,16 @@ impl EventLoop {
                 }
             }
 
-            drop(streams);
-
-            match min_wait_time {
+            streams = match min_wait_time {
                 Some(d) if d <= OVERLAP_TIME => continue,
-                Some(d) => drop(recv.recv_timeout(d - OVERLAP_TIME)),
-                None => drop(recv.recv()),
-            }
+                Some(d) => {
+                    self.waiting
+                        .wait_timeout(streams, d - OVERLAP_TIME)
+                        .unwrap()
+                        .0
+                },
+                None => self.waiting.wait(streams).unwrap(),
+            };
         }
     }
 }
@@ -326,9 +322,11 @@ impl<'a, T: 'a + Sample> OutputBuffer<'a, T> {
 
     pub fn finish(self) {
         let raw = self.data.as_ptr();
+        let state = self.stream_inner.streaming_source.state();
 
         let buf = {
-            let old_buf = (0 .. (self.stream_inner.streaming_source.buffers_queued() - 1).max(0))
+            let sub = (state == SourceState::Playing) as alto::sys::ALint;
+            let old_buf = (0 .. (self.stream_inner.streaming_source.buffers_queued() - sub).max(0))
                 .map(|_| {
                     let old_buf = self.stream_inner.streaming_source.unqueue_buffer().unwrap();
                     let size = old_buf.size();
@@ -410,9 +408,11 @@ impl<'a, T: 'a + Sample> OutputBuffer<'a, T> {
             .streaming_source
             .queue_buffer(buf)
             .expect("failed to queue alto buffer");
-        if self.stream_inner.streaming_source.state() != SourceState::Playing {
+        if state == SourceState::Initial || state == SourceState::Stopped {
+            println!("playing from finish {:?}", state);
             self.stream_inner.streaming_source.play();
         }
+        println!("finished buffer");
     }
 }
 
